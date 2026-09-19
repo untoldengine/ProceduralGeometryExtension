@@ -1,7 +1,7 @@
 # ProceduralGeometryExtension
 
 An `EngineExtension` that turns a path of 3D control points into a renderable
-tube mesh, built on [UntoldEngine](https://github.com/harold-serrano/UntoldEngine)'s
+tube mesh, built on [UntoldEngine](https://github.com/untoldengine/UntoldEngine)'s
 public API as a standalone Swift package (no engine-internal access required
 beyond the `Mesh.makeMesh` factory).
 
