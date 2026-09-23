@@ -13,17 +13,11 @@ let package = Package(
         .library(name: "ProceduralGeometryExtension", targets: ["ProceduralGeometryExtension"]),
     ],
     dependencies: [
-        // This path works only while UntoldEngine remains checked out as a sibling of this
-        // package, at ../../UntoldEngine (see /Users/haroldserrano/Desktop/UntoldEngineStudio).
-        //
-        // If you copy this package elsewhere, replace it with the absolute or relative path to
-        // your UntoldEngine checkout:
-        // .package(path: "/path/to/UntoldEngine")
-        //
-        // A distributed package should use the canonical repository URL and a compatible
-        // release requirement instead:
-        // .package(url: "https://example.com/UntoldEngine.git", from: "0.19.1")
-        .package(path: "../../UntoldEngine"),
+        // Pinned to develop, not a tagged release: this package needs Mesh.makeMesh(positions:...)
+        // /boundingBox/markEntityPickingDirty, added by UntoldEngine PR #1214 (merged into develop
+        // 2026-09-19), which hasn't shipped in a tagged release yet. Switch to a version
+        // requirement (`from: "x.y.z"`) once one that includes it is cut.
+        .package(url: "https://github.com/untoldengine/UntoldEngine.git", branch: "develop"),
     ],
     targets: [
         .target(
