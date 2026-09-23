@@ -157,8 +157,24 @@ public struct TubeEndpointDrag {
             }
         }
 
+        return applyAxisConstraint(rawPosition: rawPosition)
+    }
+
+    /// Call on the final frame of a drag gesture — its "ended"/"cancelled" phase — instead of
+    /// `update(rawPosition:)`. Applies the same axis-constrained positioning (so the tip stays
+    /// visually locked in place, not wherever the raw input landed), but never evaluates for a
+    /// new bend. Hand/input release is commonly accompanied by a small involuntary movement as
+    /// the gesture resolves — `update`'s turn detection has no way to distinguish that from a
+    /// deliberate redirect, and would otherwise be free to insert an unwanted bend right at the
+    /// moment of release.
+    @discardableResult
+    public mutating func end(rawPosition: SIMD3<Float>) -> SIMD3<Float> {
+        applyAxisConstraint(rawPosition: rawPosition)
+    }
+
+    private func applyAxisConstraint(rawPosition: SIMD3<Float>) -> SIMD3<Float> {
         let updatedDelta = rawPosition - neighborPosition
-        // Floored on every update, not just when a bend commits — dragging the tip back toward
+        // Floored on every call, not just when a bend commits — dragging the tip back toward
         // (or past) its own neighbor would otherwise shrink this segment toward zero or negative
         // length with nothing stopping it.
         let alongLockedAxis = max(dot(updatedDelta, lockedAxis), configuration.minimumSegmentLength)

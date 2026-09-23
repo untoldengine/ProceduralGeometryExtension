@@ -82,6 +82,32 @@ final class TubeEndpointDragTests: XCTestCase {
         XCTAssertGreaterThan(result.z, 0.05) // actually followed the turn, not clamped near zero
     }
 
+    func testEnd_evenWithATurnLikeRelease_neverInsertsABend() throws {
+        // Regression coverage: pinch/gesture release is commonly accompanied by a small
+        // involuntary hand movement as the gesture resolves. `end` is what a caller should call
+        // on that final frame instead of `update`, specifically so a release that happens to
+        // read like a direction change doesn't insert an unwanted bend right as the user lets go.
+        let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
+            controlPoints: [SIMD3(0, 0, 0), SIMD3(2, 0, 0)], radius: 0.1, radialSegments: 8
+        ))
+        var drag = try XCTUnwrap(TubeEndpointDrag(tubeId: entityId, isStart: false))
+
+        for step in 1 ... 10 {
+            drag.update(rawPosition: SIMD3(2 + Float(step) * 0.05, 0, 0))
+        }
+        // Exactly the kind of sample that DOES trigger a bend via `update` (see
+        // testUpdate_turningToADifferentAxis_insertsA90DegreeBend) — the whole point is that
+        // `end` must not react to it the same way.
+        let result = drag.end(rawPosition: SIMD3(2.5, 0, 0.5))
+
+        let component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
+        XCTAssertEqual(component.controlPoints.count, 2) // no bend inserted
+        // Constrained against the still-locked +X axis — the z component is ignored entirely,
+        // not followed into a new bend.
+        XCTAssertEqual(result, SIMD3(2.5, 0, 0))
+        XCTAssertEqual(component.controlPoints[1], result)
+    }
+
     func testUpdate_reversingDirection_neverInsertsABendAndClampsAtMinimumSegmentLength() throws {
         let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
             controlPoints: [SIMD3(0, 0, 0), SIMD3(2, 0, 0)], radius: 0.1, radialSegments: 8
