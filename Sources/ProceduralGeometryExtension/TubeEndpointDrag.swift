@@ -51,6 +51,12 @@ public struct TubeEndpointDrag {
     /// after every commit, which doubles as the settle time before another commit can fire: the
     /// buffer has to fill back up with fresh motion before a new heading can even be read.
     private var recentPositions: [SIMD3<Float>] = []
+    /// The `(neighborPosition, lockedAxis)` state each bend *this drag* has committed replaced,
+    /// most recent last — so a reversal past a bend this same drag just created can undo it and
+    /// resume from the segment before it, rather than only ever retracting toward (and stopping
+    /// at) it. Scoped to this one drag: bends from an earlier, already-finished gesture are never
+    /// on this stack, so a reversal can never reach back and remove one of those.
+    private var undoStack: [(neighborPosition: SIMD3<Float>, lockedAxis: SIMD3<Float>)] = []
     private let configuration: Configuration
 
     /// Tuning knobs, exposed so a consumer can adjust feel without forking this type. Defaults
@@ -114,6 +120,8 @@ public struct TubeEndpointDrag {
     /// should be placed at.
     @discardableResult
     public mutating func update(rawPosition: SIMD3<Float>) -> SIMD3<Float> {
+        undoLastBendsIfRetractedPast(rawPosition: rawPosition)
+
         recentPositions.append(rawPosition)
         if recentPositions.count > configuration.recentWindowCapacity {
             recentPositions.removeFirst()
@@ -148,6 +156,7 @@ public struct TubeEndpointDrag {
                         let insertIndex = isStart ? 1 : component.controlPoints.count - 1
 
                         if ProceduralGeometryExtension.shared.insertControlPoint(entityId: tubeId, at: insertIndex, bendPosition) {
+                            undoStack.append((neighborPosition: neighborPosition, lockedAxis: lockedAxis))
                             neighborPosition = bendPosition
                             lockedAxis = candidateAxis
                             recentPositions.removeAll(keepingCapacity: true)
@@ -170,6 +179,33 @@ public struct TubeEndpointDrag {
     @discardableResult
     public mutating func end(rawPosition: SIMD3<Float>) -> SIMD3<Float> {
         applyAxisConstraint(rawPosition: rawPosition)
+    }
+
+    /// Pops and removes bends *this drag* created, for as long as the raw position has been
+    /// pulled fully behind the current anchor along the locked axis — i.e. the user has retracted
+    /// all the way through the most recently created bend, not just shrunk toward it. A `while`,
+    /// not an `if`, so a single large single-frame retraction can undo more than one bend rather
+    /// than only reading as "past the first one, ignore the rest". Deliberately not called from
+    /// `end(rawPosition:)` — release jitter shouldn't be able to remove a bend any more than it
+    /// should be able to create one.
+    private mutating func undoLastBendsIfRetractedPast(rawPosition: SIMD3<Float>) {
+        while let previous = undoStack.last {
+            let alongLockedAxis = dot(rawPosition - neighborPosition, lockedAxis)
+            guard alongLockedAxis < 0 else { return }
+
+            guard let component = scene.get(component: TubePathComponent.self, for: tubeId) else { return }
+            let removeIndex = isStart ? 1 : component.controlPoints.count - 2
+            guard removeIndex >= 0,
+                  ProceduralGeometryExtension.shared.removeControlPoint(entityId: tubeId, at: removeIndex)
+            else {
+                return
+            }
+
+            undoStack.removeLast()
+            neighborPosition = previous.neighborPosition
+            lockedAxis = previous.lockedAxis
+            recentPositions.removeAll(keepingCapacity: true)
+        }
     }
 
     private func applyAxisConstraint(rawPosition: SIMD3<Float>) -> SIMD3<Float> {

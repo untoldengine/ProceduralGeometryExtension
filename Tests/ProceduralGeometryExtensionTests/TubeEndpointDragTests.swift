@@ -108,6 +108,89 @@ final class TubeEndpointDragTests: XCTestCase {
         XCTAssertEqual(component.controlPoints[1], result)
     }
 
+    func testUpdate_retractingPastABendThisDragCreated_undoesItAndResumesOnThePriorAxis() throws {
+        let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
+            controlPoints: [SIMD3(0, 0, 0), SIMD3(2, 0, 0)], radius: 0.1, radialSegments: 8
+        ))
+        var drag = try XCTUnwrap(TubeEndpointDrag(tubeId: entityId, isStart: false))
+
+        // Extend along +X, then turn to +Z — same setup as
+        // testUpdate_turningToADifferentAxis_insertsA90DegreeBend, committing a bend at (2.5,0,0).
+        for step in 1 ... 10 {
+            drag.update(rawPosition: SIMD3(2 + Float(step) * 0.05, 0, 0))
+        }
+        for step in 1 ... 10 {
+            drag.update(rawPosition: SIMD3(2.5, 0, Float(step) * 0.05))
+        }
+        var component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
+        XCTAssertEqual(component.controlPoints.count, 3) // bend committed
+
+        // Now retract in -Z, past the bend's own z (0) — not just shrinking the +Z segment, but
+        // pulling all the way back through the point where the turn happened.
+        for step in 1 ... 5 {
+            drag.update(rawPosition: SIMD3(2.5, 0, -Float(step) * 0.05))
+        }
+
+        component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
+        XCTAssertEqual(component.controlPoints.count, 2) // the bend is gone
+        XCTAssertEqual(component.controlPoints, [SIMD3(0, 0, 0), SIMD3(2.5, 0, 0)])
+
+        // And the drag has resumed on the restored (pre-bend) +X axis: redirecting to +Y from
+        // here creates a fresh bend at (2.5,0,0), same as a completely ordinary first turn would.
+        var result = SIMD3<Float>.zero
+        for step in 1 ... 10 {
+            result = drag.update(rawPosition: SIMD3(2.5, Float(step) * 0.05, 0))
+        }
+
+        component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
+        XCTAssertEqual(component.controlPoints.count, 3)
+        XCTAssertLessThan(simd_distance(component.controlPoints[1], SIMD3(2.5, 0, 0)), 1e-4)
+        XCTAssertEqual(component.controlPoints[2], result)
+        XCTAssertGreaterThan(result.y, 0.05)
+    }
+
+    func testUpdate_smallRetraction_doesNotUndoTheBend() throws {
+        // Shrinking the current segment without ever crossing behind the bend that started it
+        // should behave exactly as before this feature existed — no undo, just a clamp.
+        let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
+            controlPoints: [SIMD3(0, 0, 0), SIMD3(2, 0, 0)], radius: 0.1, radialSegments: 8
+        ))
+        var drag = try XCTUnwrap(TubeEndpointDrag(tubeId: entityId, isStart: false))
+
+        for step in 1 ... 10 {
+            drag.update(rawPosition: SIMD3(2 + Float(step) * 0.05, 0, 0))
+        }
+        for step in 1 ... 10 {
+            drag.update(rawPosition: SIMD3(2.5, 0, Float(step) * 0.05))
+        }
+        // Retract, but stop short of the bend's own z (0) — only shrinks the +Z segment.
+        drag.update(rawPosition: SIMD3(2.5, 0, 0.1))
+
+        let component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
+        XCTAssertEqual(component.controlPoints.count, 3) // still there
+    }
+
+    func testEnd_pastABend_doesNotUndoIt() throws {
+        // Same reasoning as end() never inserting a bend from release jitter: it shouldn't remove
+        // one either.
+        let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
+            controlPoints: [SIMD3(0, 0, 0), SIMD3(2, 0, 0)], radius: 0.1, radialSegments: 8
+        ))
+        var drag = try XCTUnwrap(TubeEndpointDrag(tubeId: entityId, isStart: false))
+
+        for step in 1 ... 10 {
+            drag.update(rawPosition: SIMD3(2 + Float(step) * 0.05, 0, 0))
+        }
+        for step in 1 ... 10 {
+            drag.update(rawPosition: SIMD3(2.5, 0, Float(step) * 0.05))
+        }
+
+        drag.end(rawPosition: SIMD3(2.5, 0, -0.5)) // well past the bend
+
+        let component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
+        XCTAssertEqual(component.controlPoints.count, 3) // bend untouched
+    }
+
     func testUpdate_reversingDirection_neverInsertsABendAndClampsAtMinimumSegmentLength() throws {
         let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
             controlPoints: [SIMD3(0, 0, 0), SIMD3(2, 0, 0)], radius: 0.1, radialSegments: 8
