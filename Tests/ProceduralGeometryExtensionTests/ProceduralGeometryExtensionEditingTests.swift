@@ -87,6 +87,59 @@ final class ProceduralGeometryExtensionEditingTests: XCTestCase {
         XCTAssertEqual(renderComponent.mesh[0].metalKitMesh.vertexCount, 32) // 2 rings * 16 segments
     }
 
+    func testCreateTubeEntity_withBendRadius_roundsTheCorner() throws {
+        let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
+            controlPoints: [SIMD3(0, 0, 0), SIMD3(2, 0, 0), SIMD3(2, 0, 2)],
+            radius: 0.2,
+            radialSegments: 8,
+            bendRadius: 0.5
+        ))
+
+        let component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
+        XCTAssertEqual(component.bendRadius, 0.5)
+
+        let sharp = try XCTUnwrap(TubeGeometryGenerator.generate(
+            controlPoints: [SIMD3(0, 0, 0), SIMD3(2, 0, 0), SIMD3(2, 0, 2)],
+            radius: 0.2, radialSegments: 8
+        ))
+        let renderComponent = try XCTUnwrap(scene.get(component: RenderComponent.self, for: entityId))
+        XCTAssertGreaterThan(renderComponent.mesh[0].metalKitMesh.vertexCount, sharp.positions.count)
+    }
+
+    func testSetBendRadius_updatesExistingTubeAndAddsRounding() throws {
+        let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
+            controlPoints: [SIMD3(0, 0, 0), SIMD3(2, 0, 0), SIMD3(2, 0, 2)],
+            radius: 0.2,
+            radialSegments: 8
+        ))
+        let sharpVertexCount = try XCTUnwrap(scene.get(component: RenderComponent.self, for: entityId))
+            .mesh[0].metalKitMesh.vertexCount
+
+        XCTAssertTrue(ProceduralGeometryExtension.shared.setBendRadius(entityId: entityId, 0.5))
+
+        let component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
+        XCTAssertEqual(component.bendRadius, 0.5)
+
+        let renderComponent = try XCTUnwrap(scene.get(component: RenderComponent.self, for: entityId))
+        XCTAssertGreaterThan(renderComponent.mesh[0].metalKitMesh.vertexCount, sharpVertexCount)
+    }
+
+    func testSetBendRadius_backToNil_restoresSharpMiter() throws {
+        let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
+            controlPoints: [SIMD3(0, 0, 0), SIMD3(2, 0, 0), SIMD3(2, 0, 2)],
+            radius: 0.2,
+            radialSegments: 8
+        ))
+        let sharpVertexCount = try XCTUnwrap(scene.get(component: RenderComponent.self, for: entityId))
+            .mesh[0].metalKitMesh.vertexCount
+
+        XCTAssertTrue(ProceduralGeometryExtension.shared.setBendRadius(entityId: entityId, 0.5))
+        XCTAssertTrue(ProceduralGeometryExtension.shared.setBendRadius(entityId: entityId, nil))
+
+        let renderComponent = try XCTUnwrap(scene.get(component: RenderComponent.self, for: entityId))
+        XCTAssertEqual(renderComponent.mesh[0].metalKitMesh.vertexCount, sharpVertexCount)
+    }
+
     func testEditingCall_returnsFalseForEntityWithoutTubePathComponent() {
         let entityId = createEntity()
         XCTAssertFalse(ProceduralGeometryExtension.shared.setRadius(entityId: entityId, 1.0))

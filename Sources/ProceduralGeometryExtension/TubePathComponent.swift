@@ -25,6 +25,9 @@ public final class TubePathComponent: Component, Codable {
     public var radialSegments: Int = 12
     public var capStart: Bool = false
     public var capEnd: Bool = false
+    /// When set (and > 0), interior corners are rounded with a tangent-arc fillet instead of a
+    /// sharp miter joint. `nil` reproduces the original sharp-corner behavior.
+    public var bendRadius: Float?
     public var assetName: String = "Tube"
 
     /// Bumped by every `ProceduralGeometryExtension` editing call. Compared against the

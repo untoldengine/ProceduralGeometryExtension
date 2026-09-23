@@ -58,6 +58,7 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
             existing.radialSegments = decoded.radialSegments
             existing.capStart = decoded.capStart
             existing.capEnd = decoded.capEnd
+            existing.bendRadius = decoded.bendRadius
             existing.assetName = decoded.assetName
             existing.contentVersion = decoded.contentVersion
         }
@@ -76,6 +77,7 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
         radialSegments: Int,
         capStart: Bool = false,
         capEnd: Bool = false,
+        bendRadius: Float? = nil,
         name: String = "Tube"
     ) -> EntityID? {
         guard let geometry = TubeGeometryGenerator.generate(
@@ -83,7 +85,8 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
             radius: radius,
             radialSegments: radialSegments,
             capStart: capStart,
-            capEnd: capEnd
+            capEnd: capEnd,
+            bendRadius: bendRadius
         ) else {
             return nil
         }
@@ -101,6 +104,7 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
         component.radialSegments = radialSegments
         component.capStart = capStart
         component.capEnd = capEnd
+        component.bendRadius = bendRadius
         component.assetName = name
         component.contentVersion = 0
 
@@ -124,12 +128,62 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
         return applyGeometryUpdate(entityId: entityId, component: component)
     }
 
+    /// Inserts a new control point at `index` (valid range `0...controlPoints.count`, i.e.
+    /// inserting at `count` appends) and updates the mesh. A point-count change is a topology
+    /// change, so this always takes the full-rebuild path.
+    ///
+    /// Returns `false` (no-op) if `index` is out of range or the entity has no `TubePathComponent`.
+    @discardableResult
+    public func insertControlPoint(entityId: EntityID, at index: Int, _ point: SIMD3<Float>) -> Bool {
+        guard let component = scene.get(component: TubePathComponent.self, for: entityId),
+              index >= 0, index <= component.controlPoints.count
+        else {
+            return false
+        }
+        component.controlPoints.insert(point, at: index)
+        component.contentVersion += 1
+        return applyGeometryUpdate(entityId: entityId, component: component)
+    }
+
+    /// Removes the control point at `index` and updates the mesh.
+    ///
+    /// Returns `false` (no-op, path left untouched) if `index` is out of range, or if removing
+    /// it would drop the tube below 2 control points — `TubeGeometryGenerator` requires at
+    /// least 2 to produce anything, so this is refused here rather than left to silently fail
+    /// deeper in the pipeline.
+    @discardableResult
+    public func removeControlPoint(entityId: EntityID, at index: Int) -> Bool {
+        guard let component = scene.get(component: TubePathComponent.self, for: entityId),
+              index >= 0, index < component.controlPoints.count,
+              component.controlPoints.count > 2
+        else {
+            return false
+        }
+        component.controlPoints.remove(at: index)
+        component.contentVersion += 1
+        return applyGeometryUpdate(entityId: entityId, component: component)
+    }
+
     /// Changes the tube radius and updates the mesh (also eligible for the in-place fast path —
     /// it changes vertex positions, not vertex/index counts).
     @discardableResult
     public func setRadius(entityId: EntityID, _ radius: Float) -> Bool {
         guard let component = scene.get(component: TubePathComponent.self, for: entityId) else { return false }
         component.radius = radius
+        component.contentVersion += 1
+        return applyGeometryUpdate(entityId: entityId, component: component)
+    }
+
+    /// Sets (or clears, with `nil`) the corner-rounding radius. Whether this takes the fast path
+    /// or a full rebuild is detected automatically, same as any other edit — going from unset to
+    /// set (or back) changes vertex/index counts (sharp corners are a single point each, rounded
+    /// ones expand to several), so that always rebuilds; changing an already-set radius to
+    /// another value that rounds the same set of corners stays on the fast path. Note this is a
+    /// global, once-per-tube setting for now, not a per-corner one.
+    @discardableResult
+    public func setBendRadius(entityId: EntityID, _ bendRadius: Float?) -> Bool {
+        guard let component = scene.get(component: TubePathComponent.self, for: entityId) else { return false }
+        component.bendRadius = bendRadius
         component.contentVersion += 1
         return applyGeometryUpdate(entityId: entityId, component: component)
     }
@@ -189,7 +243,8 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
             radius: component.radius,
             radialSegments: component.radialSegments,
             capStart: component.capStart,
-            capEnd: component.capEnd
+            capEnd: component.capEnd,
+            bendRadius: component.bendRadius
         ) else {
             return false
         }

@@ -42,6 +42,13 @@ public enum TubeGeometryGenerator {
     ///     apart are merged before generation (a zero-length segment has no direction).
     ///   - radius: Tube radius. Must be > 0.
     ///   - radialSegments: Vertices per ring. Must be >= 3.
+    ///   - bendRadius: When set (and > 0), interior corners are rounded with a tangent-arc
+    ///     fillet (`PathCornerRounding`) before sweeping, instead of the default sharp miter
+    ///     joint. `nil` (the default) reproduces the exact sharp-miter behavior — this is purely
+    ///     additive, the sweep/ring/miter code below never changes based on it.
+    ///   - bendSegmentsPerCorner: Arc resolution when `bendRadius` is set. Needs to stay
+    ///     constant across repeated calls during a drag for the in-place fast path (see
+    ///     `ProceduralGeometryExtension`) to keep recognizing the topology as unchanged.
     /// - Returns: `nil` if, after merging duplicates, fewer than 2 distinct control points
     ///   remain, or if `radius`/`radialSegments` are out of range.
     public static func generate(
@@ -49,11 +56,27 @@ public enum TubeGeometryGenerator {
         radius: Float,
         radialSegments: Int,
         capStart: Bool = false,
-        capEnd: Bool = false
+        capEnd: Bool = false,
+        bendRadius: Float? = nil,
+        bendSegmentsPerCorner: Int = 8
     ) -> Output? {
         guard radius > 0, radius.isFinite, radialSegments >= 3 else { return nil }
 
-        let points = mergeCoincidentPoints(controlPoints)
+        let mergedPoints = mergeCoincidentPoints(controlPoints)
+        guard mergedPoints.count >= 2 else { return nil }
+
+        // Corner rounding is a path-preprocessing step only — everything below sweeps whatever
+        // point list it's given exactly as before, with no knowledge of whether corners came
+        // from the caller directly or from PathCornerRounding's arcs. Merged again afterward:
+        // PathCornerRounding guards against producing coincident points itself, but this is a
+        // second, independent line of defense for this generator specifically — the thing that
+        // actually breaks on a zero-length segment is the tangent-direction normalize just
+        // below, whose NaN then propagates through every subsequent frame via the sequential
+        // parallel-transport chain, corrupting the *entire* tube rather than staying local.
+        let roundedPoints = bendRadius.map {
+            PathCornerRounding.round(path: mergedPoints, bendRadius: $0, segmentsPerCorner: bendSegmentsPerCorner)
+        } ?? mergedPoints
+        let points = mergeCoincidentPoints(roundedPoints)
         guard points.count >= 2 else { return nil }
 
         let segmentDirections = (0 ..< points.count - 1).map {
@@ -90,8 +113,13 @@ public enum TubeGeometryGenerator {
             // Project the transported right/up onto the ring's plane (its normal is the miter
             // bisector at interior points, or the segment tangent at the two ends) and
             // re-orthonormalize. This keeps the basis twist-free while still respecting the
-            // miter plane.
-            let right = normalize(frame.right - dot(frame.right, plane.normal) * plane.normal)
+            // miter plane. At a near-total-reversal corner, the plane's normal (see the
+            // orthogonal-to-incoming fallback in ringPlanes above) can end up anti-parallel to
+            // the transported right vector — the projection then removes all of it, leaving
+            // nothing to normalize. Same orthogonal(to:) fallback as everywhere else in this
+            // file for the same underlying degenerate configuration.
+            let projectedRight = frame.right - dot(frame.right, plane.normal) * plane.normal
+            let right = simd_length(projectedRight) > 1e-6 ? normalize(projectedRight) : orthogonal(to: plane.normal)
             let up = cross(plane.normal, right)
 
             // Miter radius correction: a ring on the bisector plane between two segments needs
@@ -234,7 +262,17 @@ public enum TubeGeometryGenerator {
             } else {
                 let incoming = segmentDirections[index - 1]
                 let outgoing = segmentDirections[index]
-                let bisector = normalize(incoming + outgoing)
+                // At a near-total reversal, incoming and outgoing are near-opposite, so their
+                // sum — and with it the usual bisector — degenerates toward the zero vector.
+                // Same fallback used for `bendAxis` in PathCornerRounding and for `rotate`'s
+                // near-180 branch just above: any direction orthogonal to the incoming segment
+                // is a well-defined, finite stand-in plane normal here. The miter radius
+                // correction below is already clamped for exactly this case (a near-zero dot
+                // product between an orthogonal normal and the reference direction), so this
+                // only needs to keep the normal itself finite, not geometrically "correct" — a
+                // true reversal has no clean ring plane to begin with.
+                let bisectorSum = incoming + outgoing
+                let bisector = simd_length(bisectorSum) > 1e-6 ? normalize(bisectorSum) : orthogonal(to: incoming)
                 planes.append(RingPlane(normal: bisector, referenceDirection: outgoing))
             }
         }

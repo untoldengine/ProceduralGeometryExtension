@@ -95,6 +95,40 @@ final class ProceduralGeometryExtensionPersistenceTests: XCTestCase {
         XCTAssertEqual(renderComponent.mesh[0].metalKitMesh.submeshes[0].indexCount, expectedGeometry.indices.count)
     }
 
+    func testSceneRoundTrip_restoresBendRadius() throws {
+        let controlPoints: [SIMD3<Float>] = [SIMD3(0, 0, 0), SIMD3(2, 0, 0), SIMD3(2, 0, 2)]
+        _ = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
+            controlPoints: controlPoints,
+            radius: 0.2,
+            radialSegments: 8,
+            bendRadius: 0.5,
+            name: "RoundedPersistedTube"
+        ))
+
+        let sceneData = serializeScene()
+        destroyAllEntities()
+
+        let expectation = XCTestExpectation(description: "Scene deserialized")
+        deserializeScene(sceneData: sceneData, completion: {
+            expectation.fulfill()
+        })
+        wait(for: [expectation], timeout: 10.0)
+
+        let restoredEntityId = try XCTUnwrap(
+            scene.getAllEntities().first { getEntityName(entityId: $0) == "RoundedPersistedTube" }
+        )
+        let restoredComponent = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: restoredEntityId))
+        XCTAssertEqual(restoredComponent.bendRadius, 0.5)
+
+        ProceduralGeometryExtension.shared.update(deltaTime: 1 / 60, context: idleContext)
+
+        let expectedGeometry = try XCTUnwrap(TubeGeometryGenerator.generate(
+            controlPoints: controlPoints, radius: 0.2, radialSegments: 8, bendRadius: 0.5
+        ))
+        let renderComponent = try XCTUnwrap(scene.get(component: RenderComponent.self, for: restoredEntityId))
+        XCTAssertEqual(renderComponent.mesh[0].metalKitMesh.vertexCount, expectedGeometry.positions.count)
+    }
+
     func testSceneRoundTrip_doesNotFallBackToGenericProceduralCubeRestore() throws {
         let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
             controlPoints: [SIMD3(0, 0, 0), SIMD3(0, 0, 5)],
