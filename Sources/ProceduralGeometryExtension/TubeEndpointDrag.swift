@@ -12,14 +12,16 @@ import simd
 import UntoldEngine
 
 /// The six world-axis directions a drag snaps to, so every segment created this way is exactly
-/// axis-aligned and every corner is exactly 90 degrees. Shared with `TubeInteriorBendDrag`.
-let cardinalAxes: [SIMD3<Float>] = [
+/// axis-aligned and every corner is exactly 90 degrees. Shared with `TubeInteriorBendDrag`, and
+/// public so a caller placing a *new* tube (e.g. aligning it to a detected real-world surface)
+/// can snap its initial direction the same way, instead of duplicating this math.
+public let cardinalAxes: [SIMD3<Float>] = [
     SIMD3(1, 0, 0), SIMD3(-1, 0, 0),
     SIMD3(0, 1, 0), SIMD3(0, -1, 0),
     SIMD3(0, 0, 1), SIMD3(0, 0, -1),
 ]
 
-func nearestCardinalAxis(to direction: SIMD3<Float>) -> SIMD3<Float> {
+public func nearestCardinalAxis(to direction: SIMD3<Float>) -> SIMD3<Float> {
     guard simd_length(direction) > 1e-6 else { return cardinalAxes[0] }
     let normalized = normalize(direction)
     return cardinalAxes.max { dot(normalized, $0) < dot(normalized, $1) } ?? cardinalAxes[0]
