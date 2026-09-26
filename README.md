@@ -52,7 +52,7 @@ let tubeId = ProceduralGeometryExtension.shared.createTubeEntity(
 - **`TubeGeometryGenerator`** — pure CPU sweep along a path using a rotation-minimizing (parallel-transport) frame, so the cross-section doesn't twist along the length. Sharp miter joints by default; tangent-arc rounded corners via `PathCornerRounding` when `bendRadius` is set. Both are hardened against degenerate near-180-degree corners (found through real interactive testing, not just inspection — see `TubeGeometryGeneratorTests`/`PathCornerRoundingTests`).
 - **`TubePathComponent` + `ProceduralGeometryExtension`** — entity creation and a full editing API (below), plus a per-tick safety net that catches component changes made outside that API (e.g. a scene load).
 - **Interactive fast path** — same-topology updates (the common case while dragging a control point) write new vertex data directly into the existing GPU buffer instead of rebuilding the mesh, for XR editing without per-frame allocation.
-- **`TubeEndpointDrag` / `TubeInteriorBendDrag`** — ready-to-use interactive editing logic: extend an endpoint with automatic 90-degree bend creation on turn and undo-by-reversal, or reshape/remove an existing bend by sliding it along one of its two segments. Neither type knows anything about picking or rendering — see below.
+- **`TubeEndpointDrag` / `TubeInteriorBendDrag` / `TubeTranslationDrag`** — ready-to-use interactive editing logic: extend an endpoint with automatic 90-degree bend creation on turn and undo-by-reversal, reshape/remove an existing bend by sliding it along one of its two segments, or move an entire tube as a rigid body. None of the three knows anything about picking or rendering — see below.
 - **Scene persistence** via `encodeCustomComponent`, bypassing the engine's lossy generic `.procedural` asset-name restore path.
 
 ## Editing API
@@ -73,7 +73,7 @@ The underlying data lives in `TubePathComponent` (`controlPoints`, `radius`, `ra
 
 ## Interactive dragging
 
-`TubeEndpointDrag` and `TubeInteriorBendDrag` implement the actual axis-locking/turn-detection/undo logic behind interactive editing. Each consumes a raw 3D position every frame — from wherever you get one: XR pinch tracking, a mouse, a game controller, a test — and reports back where the dragged point should now be. They don't create entities, don't do picking, and don't know your app exists; how you decide *what's* being dragged (a picking proxy, a gizmo, proximity-based selection) is entirely up to the consuming app.
+`TubeEndpointDrag`, `TubeInteriorBendDrag`, and `TubeTranslationDrag` implement the actual axis-locking/turn-detection/undo/rigid-shift logic behind interactive editing. Each consumes a raw 3D position every frame — from wherever you get one: XR pinch tracking, a mouse, a game controller, a test — and reports back where the dragged point (or, for `TubeTranslationDrag`, the whole tube) should now be. None of the three creates entities, does picking, or knows your app exists; how you decide *what's* being dragged (a picking proxy, a gizmo, proximity-based selection) is entirely up to the consuming app.
 
 **`TubeEndpointDrag`** — drag a tube's start or end:
 
@@ -102,7 +102,17 @@ if let position = bendDrag?.update(rawPosition: currentHandPosition) {
 }
 ```
 
-Both expose a `Configuration` struct for tuning sensitivity/thresholds without forking the type — see their doc comments for defaults and what each knob controls.
+**`TubeTranslationDrag`** — move an entire tube as a rigid body, unconstrained (no axis locking — moving a tube doesn't change any angle *between* its own segments, so there's no structural reason to restrict it):
+
+```swift
+var moveDrag = TubeTranslationDrag(tubeId: tubeId, dragOrigin: currentHandPosition)
+
+// Every frame the gesture continues — no `end` call needed, since a rigid
+// shift has no structural change for release jitter to spuriously trigger:
+moveDrag?.update(rawPosition: currentHandPosition)
+```
+
+`TubeEndpointDrag` and `TubeInteriorBendDrag` also expose a `Configuration` struct for tuning sensitivity/thresholds without forking the type — see their doc comments for defaults and what each knob controls.
 
 ## Testing
 
@@ -110,4 +120,4 @@ Both expose a `Configuration` struct for tuning sensitivity/thresholds without f
 swift test
 ```
 
-85 tests cover geometry math (including degenerate-corner hardening), entity integration, the full editing API, both interactive drag types (driven with synthetic positions, no XR required), the fast path, and save/load round-trips.
+89 tests cover geometry math (including degenerate-corner hardening), entity integration, the full editing API, all three interactive drag types (driven with synthetic positions, no XR required), the fast path, and save/load round-trips.
