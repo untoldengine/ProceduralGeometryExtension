@@ -21,10 +21,19 @@ public let cardinalAxes: [SIMD3<Float>] = [
     SIMD3(0, 0, 1), SIMD3(0, 0, -1),
 ]
 
-public func nearestCardinalAxis(to direction: SIMD3<Float>) -> SIMD3<Float> {
-    guard simd_length(direction) > 1e-6 else { return cardinalAxes[0] }
-    let normalized = normalize(direction)
-    return cardinalAxes.max { dot(normalized, $0) < dot(normalized, $1) } ?? cardinalAxes[0]
+/// Snaps `direction` to whichever of the 6 cardinal axes it's closest to — or, if `rotation` is
+/// given, to the nearest axis in *that rotated frame* instead of raw world space. `rotation` nil
+/// (the default) reproduces plain world-axis snapping; a non-nil rotation is what lets a tube's
+/// own reference frame (see `TubePathComponent.referenceRotation`) be something other than world
+/// space, e.g. relative to a real-world wall.
+public func nearestCardinalAxis(to direction: SIMD3<Float>, relativeTo rotation: simd_quatf? = nil) -> SIMD3<Float> {
+    let localDirection = rotation.map { $0.inverse.act(direction) } ?? direction
+    guard simd_length(localDirection) > 1e-6 else {
+        return rotation.map { $0.act(cardinalAxes[0]) } ?? cardinalAxes[0]
+    }
+    let normalized = normalize(localDirection)
+    let localAxis = cardinalAxes.max { dot(normalized, $0) < dot(normalized, $1) } ?? cardinalAxes[0]
+    return rotation.map { $0.act(localAxis) } ?? localAxis
 }
 
 /// Interactive, axis-constrained editing of a tube's start or end control point: extending it
@@ -53,12 +62,30 @@ public struct TubeEndpointDrag {
     /// after every commit, which doubles as the settle time before another commit can fire: the
     /// buffer has to fill back up with fresh motion before a new heading can even be read.
     private var recentPositions: [SIMD3<Float>] = []
+    /// Which non-locked axis the *last several* recent-window reads have agreed on, and for how
+    /// many consecutive `update()` calls — a turn only actually commits once this streak reaches
+    /// `configuration.turnConfirmationFrames`. Reset to `nil`/0 the instant a read disagrees (a
+    /// different axis, the locked axis itself, or a margin that's no longer clearly dominant), so
+    /// a brief off-axis blip — unpinch jitter, a hand settling into a new grip while
+    /// repositioning — can never itself accumulate enough consecutive evidence to read as
+    /// deliberate, while a genuinely sustained redirect still commits within a handful of frames.
+    private var pendingTurnAxis: SIMD3<Float>?
+    private var pendingTurnStreak: Int = 0
     /// The `(neighborPosition, lockedAxis)` state each bend *this drag* has committed replaced,
     /// most recent last — so a reversal past a bend this same drag just created can undo it and
     /// resume from the segment before it, rather than only ever retracting toward (and stopping
     /// at) it. Scoped to this one drag: bends from an earlier, already-finished gesture are never
     /// on this stack, so a reversal can never reach back and remove one of those.
     private var undoStack: [(neighborPosition: SIMD3<Float>, lockedAxis: SIMD3<Float>)] = []
+    /// The last *effective* (post-clamp) position fed through `clampToPlausibleStep`, or `nil`
+    /// before the first call. Deliberately the clamped value, not the raw input — so a sustained
+    /// run of implausible readings gets rate-limited frame over frame rather than jumping straight
+    /// to the first bad sample and then tracking normally from there.
+    private var lastEffectivePosition: SIMD3<Float>?
+    /// This tube's own reference frame (`TubePathComponent.referenceRotation`, read once at
+    /// `init`), used for every `nearestCardinalAxis` call this drag makes — `nil` reproduces
+    /// plain world-axis snapping.
+    private let rotation: simd_quatf?
     private let configuration: Configuration
 
     /// Tuning knobs, exposed so a consumer can adjust feel without forking this type. Defaults
@@ -79,15 +106,65 @@ public struct TubeEndpointDrag {
         /// meaningful edit, so this keeps segments sane rather than relying on that hardening
         /// alone.
         public var minimumSegmentLength: Float
+        /// How much more strongly the recent-window heading must align with a candidate axis than
+        /// with the *currently locked* axis (a difference of dot products, both in [-1, 1]) before
+        /// that candidate counts as dominant at all. Without this, whichever axis is numerically
+        /// highest wins even by a hair's-breadth margin over just continuing straight — meaning
+        /// ordinary hand wobble well short of a real 90-degree redirect could still flip the
+        /// candidate axis back and forth. This is what "dominant" actually requires; a candidate
+        /// that doesn't clear it doesn't get a vote toward `turnConfirmationFrames` at all.
+        public var axisDominanceMargin: Float
+        /// How many consecutive `update()` calls a candidate axis must stay dominant (per
+        /// `axisDominanceMargin`) before it actually commits as a bend. A single window reading
+        /// "some other axis is dominant now" is only ever *evidence* of a turn, not proof of one —
+        /// this is the number of frames of agreeing evidence required before acting on it. Higher
+        /// values trade a little responsiveness for a lot more immunity to brief non-deliberate
+        /// motion (release jitter, resettling grip mid-drag); 1 reproduces the old immediate-commit
+        /// behavior.
+        /// Also acts as a defense against a short burst of implausible samples (see
+        /// `maximumFrameStep`): once such a burst ages out of the recent window, its *oldest*
+        /// samples get compared against genuinely-recovered *newest* samples, which can read as a
+        /// sustained redirect for as many consecutive calls as the burst was long. Requiring more
+        /// confirmation frames than any plausible burst length is real, independent margin against
+        /// that — see `testUpdate_implausibleTrackingGlitchBurst_doesNotInsertABend`.
+        public var turnConfirmationFrames: Int
+        /// The largest distance a single `update()`/`end()` call is allowed to move the *effective*
+        /// tracked position from the previous call's effective position. A raw input arriving
+        /// farther than this is clamped to this distance, in the same direction, rather than
+        /// trusted outright.
+        ///
+        /// This exists because a burst of implausible samples — a hand-tracking glitch, a
+        /// momentary teleport — doesn't just corrupt the frames it arrives on. As those samples
+        /// age out of the recent window, they get compared as its *oldest* reference against
+        /// genuinely-recovered *newest* samples, which can read as several *consecutive* frames of
+        /// dominance toward some other axis even though the hand only glitched briefly, once —
+        /// satisfying `turnConfirmationFrames` on borrowed evidence rather than real sustained
+        /// motion. Bounding how far any single frame's effective position can move directly bounds
+        /// how large that borrowed evidence can ever get. See
+        /// `testUpdate_implausibleTrackingGlitchBurst_doesNotInsertABend`, and
+        /// `turnConfirmationFrames`'s own doc comment for the other half of this defense.
+        ///
+        /// The default (0.15m) is deliberately generous — well above any plausible per-frame
+        /// distance for a deliberate drag at ordinary XR frame rates — so it only ever catches
+        /// readings no real hand motion could have produced; ordinary startles or resettles (tens
+        /// of centimeters) are already handled by `axisDominanceMargin` and `turnConfirmationFrames`
+        /// without ever reaching this clamp.
+        public var maximumFrameStep: Float
 
         public init(
             recentWindowCapacity: Int = 10,
             minimumRecentDragDistance: Float = 0.02,
-            minimumSegmentLength: Float = 0.05
+            minimumSegmentLength: Float = 0.05,
+            axisDominanceMargin: Float = 0.5,
+            turnConfirmationFrames: Int = 8,
+            maximumFrameStep: Float = 0.15
         ) {
             self.recentWindowCapacity = recentWindowCapacity
             self.minimumRecentDragDistance = minimumRecentDragDistance
             self.minimumSegmentLength = minimumSegmentLength
+            self.axisDominanceMargin = axisDominanceMargin
+            self.turnConfirmationFrames = turnConfirmationFrames
+            self.maximumFrameStep = maximumFrameStep
         }
 
         public static let `default` = Configuration()
@@ -111,7 +188,8 @@ public struct TubeEndpointDrag {
         self.tubeId = tubeId
         self.isStart = isStart
         self.neighborPosition = neighborPosition
-        self.lockedAxis = nearestCardinalAxis(to: currentPosition - neighborPosition)
+        self.rotation = component.referenceRotation
+        self.lockedAxis = nearestCardinalAxis(to: currentPosition - neighborPosition, relativeTo: rotation)
         self.configuration = configuration
     }
 
@@ -122,6 +200,7 @@ public struct TubeEndpointDrag {
     /// should be placed at.
     @discardableResult
     public mutating func update(rawPosition: SIMD3<Float>) -> SIMD3<Float> {
+        let rawPosition = clampToPlausibleStep(rawPosition)
         undoLastBendsIfRetractedPast(rawPosition: rawPosition)
 
         recentPositions.append(rawPosition)
@@ -138,13 +217,32 @@ public struct TubeEndpointDrag {
         if recentPositions.count == configuration.recentWindowCapacity {
             let recentDelta = rawPosition - recentPositions[0]
             if simd_length(recentDelta) > configuration.minimumRecentDragDistance {
-                let candidateAxis = nearestCardinalAxis(to: recentDelta)
+                let normalizedDelta = normalize(recentDelta)
+                let candidateAxis = nearestCardinalAxis(to: recentDelta, relativeTo: rotation)
                 // Reversing straight back along the locked axis is a distinct cardinal axis
                 // (+X and -X are different directions to nearestCardinalAxis), but it isn't a
                 // real 90-degree corner — it's a retraction, already handled by the length floor
                 // below. A 180-degree "bend" isn't geometrically a corner at all, and isn't a
                 // 90-degree bend, which is all a caller using this type is choosing to allow.
-                if candidateAxis != lockedAxis, candidateAxis != -lockedAxis {
+                //
+                // A candidate also has to beat the *locked* axis by a real margin, not just be
+                // numerically highest — see axisDominanceMargin's doc comment — and then has to
+                // keep winning for several consecutive calls before it's acted on at all; see
+                // turnConfirmationFrames's.
+                if candidateAxis != lockedAxis, candidateAxis != -lockedAxis,
+                   dot(normalizedDelta, candidateAxis) - dot(normalizedDelta, lockedAxis) > configuration.axisDominanceMargin {
+                    if pendingTurnAxis == candidateAxis {
+                        pendingTurnStreak += 1
+                    } else {
+                        pendingTurnAxis = candidateAxis
+                        pendingTurnStreak = 1
+                    }
+                } else {
+                    pendingTurnAxis = nil
+                    pendingTurnStreak = 0
+                }
+
+                if pendingTurnStreak >= configuration.turnConfirmationFrames {
                     let fullDelta = rawPosition - neighborPosition
                     let alongLockedAxis = dot(fullDelta, lockedAxis)
                     if alongLockedAxis > configuration.minimumSegmentLength,
@@ -162,9 +260,14 @@ public struct TubeEndpointDrag {
                             neighborPosition = bendPosition
                             lockedAxis = candidateAxis
                             recentPositions.removeAll(keepingCapacity: true)
+                            pendingTurnAxis = nil
+                            pendingTurnStreak = 0
                         }
                     }
                 }
+            } else {
+                pendingTurnAxis = nil
+                pendingTurnStreak = 0
             }
         }
 
@@ -180,7 +283,27 @@ public struct TubeEndpointDrag {
     /// moment of release.
     @discardableResult
     public mutating func end(rawPosition: SIMD3<Float>) -> SIMD3<Float> {
-        applyAxisConstraint(rawPosition: rawPosition)
+        let rawPosition = clampToPlausibleStep(rawPosition)
+        return applyAxisConstraint(rawPosition: rawPosition)
+    }
+
+    /// Clamps `rawPosition` to at most `configuration.maximumFrameStep` from the last *effective*
+    /// (already-clamped) position, in the same direction — see `maximumFrameStep`'s doc comment for
+    /// why. The very first call of a drag has no prior effective position to clamp against, so it
+    /// always passes through unclamped (there's no "previous frame" for a first sample to jump
+    /// implausibly far from).
+    private mutating func clampToPlausibleStep(_ rawPosition: SIMD3<Float>) -> SIMD3<Float> {
+        guard let lastEffectivePosition else {
+            self.lastEffectivePosition = rawPosition
+            return rawPosition
+        }
+        let step = rawPosition - lastEffectivePosition
+        let stepLength = simd_length(step)
+        let effective = stepLength > configuration.maximumFrameStep
+            ? lastEffectivePosition + (step / stepLength) * configuration.maximumFrameStep
+            : rawPosition
+        self.lastEffectivePosition = effective
+        return effective
     }
 
     /// Pops and removes bends *this drag* created, for as long as the raw position has been
@@ -207,6 +330,8 @@ public struct TubeEndpointDrag {
             neighborPosition = previous.neighborPosition
             lockedAxis = previous.lockedAxis
             recentPositions.removeAll(keepingCapacity: true)
+            pendingTurnAxis = nil
+            pendingTurnStreak = 0
         }
     }
 

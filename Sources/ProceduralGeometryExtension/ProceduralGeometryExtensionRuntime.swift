@@ -59,6 +59,7 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
             existing.capStart = decoded.capStart
             existing.capEnd = decoded.capEnd
             existing.bendRadius = decoded.bendRadius
+            existing.referenceRotationVector = decoded.referenceRotationVector
             existing.assetName = decoded.assetName
             existing.contentVersion = decoded.contentVersion
         }
@@ -78,6 +79,7 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
         capStart: Bool = false,
         capEnd: Bool = false,
         bendRadius: Float? = nil,
+        referenceRotation: simd_quatf? = nil,
         name: String = "Tube"
     ) -> EntityID? {
         guard let geometry = TubeGeometryGenerator.generate(
@@ -105,6 +107,7 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
         component.capStart = capStart
         component.capEnd = capEnd
         component.bendRadius = bendRadius
+        component.referenceRotation = referenceRotation
         component.assetName = name
         component.contentVersion = 0
 
@@ -186,6 +189,17 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
         component.bendRadius = bendRadius
         component.contentVersion += 1
         return applyGeometryUpdate(entityId: entityId, component: component)
+    }
+
+    /// Sets (or clears, with `nil`) this tube's reference rotation for axis-locked editing — see
+    /// `TubePathComponent.referenceRotation`. Purely a drag-time hint that `TubeEndpointDrag`/
+    /// `TubeInteriorBendDrag` read at the start of a drag; unlike every other editing call here,
+    /// it never touches the mesh, so this doesn't bump `contentVersion` or trigger a rebuild.
+    @discardableResult
+    public func setReferenceRotation(entityId: EntityID, _ rotation: simd_quatf?) -> Bool {
+        guard let component = scene.get(component: TubePathComponent.self, for: entityId) else { return false }
+        component.referenceRotation = rotation
+        return true
     }
 
     /// Changes the radial segment count — a topology change, every ring gets a different vertex

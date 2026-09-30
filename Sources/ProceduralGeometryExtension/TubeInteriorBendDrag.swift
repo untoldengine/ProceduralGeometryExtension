@@ -74,9 +74,10 @@ public struct TubeInteriorBendDrag {
         self.index = index
         originalControlPoints = component.controlPoints
         dragOrigin = component.controlPoints[index]
+        let rotation = component.referenceRotation
         candidateAxes = (
-            back: nearestCardinalAxis(to: component.controlPoints[index] - component.controlPoints[index - 1]),
-            forward: nearestCardinalAxis(to: component.controlPoints[index + 1] - component.controlPoints[index])
+            back: nearestCardinalAxis(to: component.controlPoints[index] - component.controlPoints[index - 1], relativeTo: rotation),
+            forward: nearestCardinalAxis(to: component.controlPoints[index + 1] - component.controlPoints[index], relativeTo: rotation)
         )
         lockedAxis = nil
         self.configuration = configuration
