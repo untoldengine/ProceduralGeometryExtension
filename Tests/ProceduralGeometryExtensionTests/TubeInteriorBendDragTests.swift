@@ -51,6 +51,37 @@ final class TubeInteriorBendDragTests: XCTestCase {
         XCTAssertNil(TubeInteriorBendDrag(tubeId: entityId, index: path.count))
     }
 
+    func testUpdate_withReferenceRotation_locksToTheRotatedFrameNotWorldAxes() throws {
+        // Same 90-degrees-around-Y rotation as the equivalent TubeEndpointDrag test — local +X
+        // maps to world (0, 0, -1); local +Y is unaffected (it's the rotation axis). This is
+        // `path` (see the class-level doc comment) with that rotation applied to every point, so
+        // segment directions are this tube's own rotated local axes, not raw world ones.
+        let rotation = simd_quatf(angle: .pi / 2, axis: SIMD3(0, 1, 0))
+        let rotatedPath: [SIMD3<Float>] = [
+            SIMD3(0, 0, 0), SIMD3(0, 0, -2), SIMD3(0, 3, -2), SIMD3(0, 3, -5),
+        ]
+        let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
+            controlPoints: rotatedPath, radius: 0.1, radialSegments: 8, referenceRotation: rotation
+        ))
+        var drag = try XCTUnwrap(TubeInteriorBendDrag(tubeId: entityId, index: 1))
+
+        // Small pull toward the back neighbor (index 0), along the rotated back axis (world
+        // (0, 0, -1), not raw world +X or +Z) — same shape as
+        // testUpdate_smallPullTowardBackNeighbor_locksBackAxisNotForward, just in this tube's
+        // rotated frame instead of world space.
+        let result = try XCTUnwrap(drag.update(rawPosition: SIMD3(0, 0, -1.7)))
+
+        // Moved along the rotated back axis (approximate: sin/cos of a right-angle rotation
+        // aren't exactly 0/1 in float32).
+        XCTAssertLessThan(simd_distance(result, SIMD3(0, 0, -1.7)), 1e-6)
+        let component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
+        // The forward chain (indices 2, 3) shifted rigidly by the same (0, 0, 0.3) delta.
+        let expected: [SIMD3<Float>] = [SIMD3(0, 0, 0), SIMD3(0, 0, -1.7), SIMD3(0, 3, -1.7), SIMD3(0, 3, -4.7)]
+        for (actual, expectedPoint) in zip(component.controlPoints, expected) {
+            XCTAssertLessThan(simd_distance(actual, expectedPoint), 1e-6)
+        }
+    }
+
     func testUpdate_belowIntentThreshold_holdsAtOrigin() throws {
         let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
             controlPoints: path, radius: 0.1, radialSegments: 8
