@@ -352,7 +352,13 @@ final class TubeEndpointDragTests: XCTestCase {
 
         let component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
         XCTAssertEqual(component.controlPoints.count, 2) // never grew — no spurious bend
-        XCTAssertEqual(result.x, 0.05, accuracy: 1e-4) // floored, not driven to/past the neighbor
+        // Floored, not driven to/past the neighbor — at `configuration.minimumSegmentLength`
+        // (0.05), not the tube's diameter: neither end of this segment is a real corner (both are
+        // the path's own open ends), so the required *clearance* there is zero — see
+        // `TubeEndpointDrag.effectiveMinimumSegmentLength` and
+        // `TubeGeometryGenerator.requiredMiterClearance`'s doc comment for why a straight run needs
+        // no miter clearance at all, unlike an actual bend.
+        XCTAssertEqual(result.x, 0.05, accuracy: 1e-4)
         XCTAssertEqual(component.controlPoints[1], result)
     }
 

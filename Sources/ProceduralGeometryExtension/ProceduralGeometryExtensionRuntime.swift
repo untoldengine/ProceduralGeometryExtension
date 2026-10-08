@@ -70,7 +70,11 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
     ///
     /// Returns `nil` (and creates nothing) if `TubeGeometryGenerator`/`Mesh.makeMesh` reject the
     /// input — e.g. fewer than two distinct control points, a non-positive radius, or fewer
-    /// than three radial segments.
+    /// than three radial segments — or if any two adjacent (non-coincident) control points are
+    /// closer together than `TubeGeometryGenerator.minimumSegmentLength(forRadius:)` allows for
+    /// this `radius`. That spacing check exists here, not just in the interactive drag types, so
+    /// a tube can never be *created* already self-intersecting — e.g. from programmatic or
+    /// scripted input that never went through a drag at all.
     @discardableResult
     public func createTubeEntity(
         controlPoints: [SIMD3<Float>],
@@ -82,6 +86,9 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
         referenceRotation: simd_quatf? = nil,
         name: String = "Tube"
     ) -> EntityID? {
+        guard TubeGeometryGenerator.hasValidControlPointSpacing(controlPoints, radius: radius) else {
+            return nil
+        }
         guard let geometry = TubeGeometryGenerator.generate(
             controlPoints: controlPoints,
             radius: radius,
@@ -123,9 +130,22 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
     /// same point count, same radial segments, same caps — takes the in-place fast path (see
     /// `applyGeometryUpdate`); anything that changes vertex/index counts falls back to a full
     /// rebuild automatically.
+    ///
+    /// Returns `false` (no-op, path left untouched) if the entity has no `TubePathComponent`, or
+    /// if `controlPoints` would place any two adjacent (non-coincident) points closer together
+    /// than `TubeGeometryGenerator.minimumSegmentLength(forRadius:)` allows for this tube's
+    /// radius — see that method's doc comment for why that spacing, specifically, is the line.
+    /// `TubeEndpointDrag`/`TubeInteriorBendDrag` already clamp to this same floor before ever
+    /// calling here, so a drag-driven call never actually hits this guard; it exists for every
+    /// other caller — a future drag type, undo/redo, or any other programmatic edit — that isn't
+    /// guaranteed to have clamped first.
     @discardableResult
     public func setControlPoints(entityId: EntityID, _ controlPoints: [SIMD3<Float>]) -> Bool {
-        guard let component = scene.get(component: TubePathComponent.self, for: entityId) else { return false }
+        guard let component = scene.get(component: TubePathComponent.self, for: entityId),
+              TubeGeometryGenerator.hasValidControlPointSpacing(controlPoints, radius: component.radius)
+        else {
+            return false
+        }
         component.controlPoints = controlPoints
         component.contentVersion += 1
         return applyGeometryUpdate(entityId: entityId, component: component)
@@ -135,7 +155,10 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
     /// inserting at `count` appends) and updates the mesh. A point-count change is a topology
     /// change, so this always takes the full-rebuild path.
     ///
-    /// Returns `false` (no-op) if `index` is out of range or the entity has no `TubePathComponent`.
+    /// Returns `false` (no-op, path left untouched) if `index` is out of range, the entity has no
+    /// `TubePathComponent`, or inserting `point` there would place it closer than
+    /// `TubeGeometryGenerator.minimumSegmentLength(forRadius:)` to either neighbor it would then
+    /// sit between — same reasoning and same floor as `setControlPoints`.
     @discardableResult
     public func insertControlPoint(entityId: EntityID, at index: Int, _ point: SIMD3<Float>) -> Bool {
         guard let component = scene.get(component: TubePathComponent.self, for: entityId),
@@ -143,7 +166,12 @@ public final class ProceduralGeometryExtension: EngineExtension, @unchecked Send
         else {
             return false
         }
-        component.controlPoints.insert(point, at: index)
+        var updatedControlPoints = component.controlPoints
+        updatedControlPoints.insert(point, at: index)
+        guard TubeGeometryGenerator.hasValidControlPointSpacing(updatedControlPoints, radius: component.radius) else {
+            return false
+        }
+        component.controlPoints = updatedControlPoints
         component.contentVersion += 1
         return applyGeometryUpdate(entityId: entityId, component: component)
     }
