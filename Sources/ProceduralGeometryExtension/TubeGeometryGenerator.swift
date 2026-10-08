@@ -37,6 +37,137 @@ public enum TubeGeometryGenerator {
         public let capEnd: Bool
     }
 
+    /// The absolute *lower bound* on a valid segment length for any `radius` — achieved only
+    /// when neither end of the segment is a real corner (both ends are the path's own open ends,
+    /// or a straight, same-direction continuation), so both end rings are the plain,
+    /// un-mitered `radius`. A genuine bend on either end needs *more* than this — see
+    /// `requiredRingRadius(at:in:radius:)` and `hasValidControlPointSpacing`, which account for
+    /// the actual corner angle instead of assuming this best case. Kept as a cheap, conservative
+    /// pre-check callers can use when they only know a radius and no path shape yet (there's
+    /// nothing shorter than this that could ever be valid, for any configuration).
+    public static func minimumSegmentLength(forRadius radius: Float) -> Float {
+        radius * 2
+    }
+
+    /// Default epsilon `generate`'s own internal merge pass uses to treat two adjacent points as
+    /// coincident (and therefore collapse to one, rather than sweep a near-zero segment). Exposed
+    /// so a caller validating points *before* they reach `generate` — e.g.
+    /// `hasValidControlPointSpacing` below — agrees on exactly the same boundary between "will be
+    /// merged away harmlessly" and "is a real, if short, segment".
+    public static let coincidentEpsilon: Float = 1e-5
+
+    /// How far below a required length a distance is still accepted as "at the floor" rather than
+    /// rejected — pure floating-point slack, not a relaxation of the actual geometric rule. A drag
+    /// that clamps its own output to exactly a computed floor (see
+    /// `TubeInteriorBendDrag.clampedScalar`) accumulates a few ULPs of error doing so (subtracting
+    /// and re-adding vector components along an axis); without this slack, a legitimately-clamped
+    /// position could land a hair's-breadth under the floor and get rejected by
+    /// `hasValidControlPointSpacing` on the very next frame, which would read to the user as the
+    /// drag randomly freezing early rather than holding cleanly at the minimum separation.
+    public static let spacingTolerance: Float = 1e-4
+
+    /// The ring radius needed at the corner where the path arrives along `incoming` and leaves
+    /// along `outgoing` (both unit vectors) so the tube's actual cross-section — perpendicular to
+    /// travel — stays equal to `radius` there, instead of shrinking. `cos(halfAngle)` via the
+    /// half-angle identity `cos(θ/2) = sqrt((1 + cosθ) / 2)`, θ = the angle between the two
+    /// directions — this avoids needing the bisector vector (and its own near-180° degenerate
+    /// case, handled separately in `ringPlanes` for the ring's *orientation*, not its radius) just
+    /// to get this scalar magnitude. An exact reversal (`cosθ == -1`) divides by zero: in `Float`
+    /// arithmetic that's `.infinity`, not a trap, and every caller of this treats `.infinity` as
+    /// "this corner needs more clearance than any finite segment could give it" — which is the
+    /// actual geometric truth, not a bug to patch around. This generator never shrinks a ring
+    /// below this value to make it fit a short segment (an earlier version did — see
+    /// `hasValidControlPointSpacing`'s doc comment for why that made the tube visibly thinner
+    /// right where it was needed most); if a ring can't have this radius without overlapping its
+    /// neighbor, the edit that would have caused it is refused instead.
+    public static func requiredMiterRingRadius(radius: Float, incoming: SIMD3<Float>, outgoing: SIMD3<Float>) -> Float {
+        let cosDelta = simd_clamp(dot(incoming, outgoing), -1, 1)
+        let cosHalfAngle = sqrt(max(0, (1 + cosDelta) / 2))
+        return radius / cosHalfAngle
+    }
+
+    /// The ring radius `generate` needs at `points[index]` to keep the cross-section equal to
+    /// `radius` there: plain `radius` at either path end (`index == 0` or
+    /// `index == points.count - 1` — there's no second segment to miter against), or
+    /// `requiredMiterRingRadius` for every interior point, computed from its own two immediate
+    /// neighbors in `points`. Callers that already know a point's two neighbor directions won't
+    /// change for the life of an edit (both `TubeEndpointDrag` and `TubeInteriorBendDrag` keep
+    /// every corner axis-locked, so this is true for every corner either type touches) can call
+    /// this once and treat the result as a constant for that edit, rather than recomputing it
+    /// every frame.
+    public static func requiredRingRadius(at index: Int, in points: [SIMD3<Float>], radius: Float) -> Float {
+        guard index > 0, index < points.count - 1 else { return radius }
+        let incoming = normalize(points[index] - points[index - 1])
+        let outgoing = normalize(points[index + 1] - points[index])
+        return requiredMiterRingRadius(radius: radius, incoming: incoming, outgoing: outgoing)
+    }
+
+    /// How far along *each* adjacent segment the corner where the path arrives along `incoming`
+    /// and leaves along `outgoing` "consumes" — the same quantity, and the same formula, as
+    /// `PathCornerRounding`'s own `tangentLength = bendRadius * tan(halfAngle)`, just with the
+    /// tube's own `radius` standing in for a fillet's `bendRadius` (a sharp miter join is the
+    /// limit of a fillet as its arc radius shrinks to a single point, so the same tangent-length
+    /// relationship applies). This is *not* the ring's radius (see `requiredMiterRingRadius`,
+    /// which is a perpendicular-to-travel measurement) — it's a parallel-to-travel one, and
+    /// they're genuinely different quantities: this is the one `hasValidControlPointSpacing` needs
+    /// (how much of a *segment* a corner eats into, so two corners sharing one segment can be
+    /// compared against that segment's length), not the ring radius, which has no direct
+    /// relationship to segment length at all (a barely-bent ring can still have a large radius —
+    /// a big tube is still a big tube on a gentle curve — while still consuming almost no length
+    /// from its segment, exactly what makes a finely-subdivided `bendRadius` fillet's many gentle
+    /// sub-joints each individually cheap, even though the tube's radius at every one of them is
+    /// essentially unchanged from nominal). Zero at a perfectly straight pass-through (`incoming ==
+    /// outgoing`); grows to `.infinity` at an exact reversal, same reasoning as
+    /// `requiredMiterRingRadius`.
+    public static func requiredMiterClearance(radius: Float, incoming: SIMD3<Float>, outgoing: SIMD3<Float>) -> Float {
+        let cosDelta = simd_clamp(dot(incoming, outgoing), -1, 1)
+        let cosHalfAngle = sqrt(max(0, (1 + cosDelta) / 2))
+        let sinHalfAngle = sqrt(max(0, (1 - cosDelta) / 2))
+        return radius * sinHalfAngle / cosHalfAngle
+    }
+
+    /// The clearance `points[index]` consumes from each of its two adjacent segments: zero at
+    /// either path end (`index == 0` or `index == points.count - 1` — nothing to miter against),
+    /// or `requiredMiterClearance` for every interior point. See that function's doc comment for
+    /// why this, not `requiredRingRadius`, is the quantity a segment-length check needs. Same
+    /// "safe to compute once and treat as a constant for the life of an edit" note as
+    /// `requiredRingRadius` applies here too.
+    public static func requiredClearance(at index: Int, in points: [SIMD3<Float>], radius: Float) -> Float {
+        guard index > 0, index < points.count - 1 else { return 0 }
+        let incoming = normalize(points[index] - points[index - 1])
+        let outgoing = normalize(points[index + 1] - points[index])
+        return requiredMiterClearance(radius: radius, incoming: incoming, outgoing: outgoing)
+    }
+
+    /// Whether `radius` can be swept along `controlPoints` without any corner needing to consume
+    /// more clearance (`requiredClearance(at:in:radius:)`) than its adjacent segment(s) actually
+    /// have — two corners sharing a segment of length `L` fit without overlapping exactly when
+    /// `requiredClearance(at: i) + requiredClearance(at: i+1) <= L` (within `spacingTolerance`).
+    /// This replaces an earlier, angle-blind version of this check (a flat
+    /// `minimumSegmentLength(forRadius:)` for every segment, regardless of how sharp its corners
+    /// were) — that version let a segment between two genuine bends pass as "valid" even though
+    /// `generate`'s own miter correction would need a *wider-than-nominal* ring there, which it was
+    /// resolving by silently shrinking the ring (and with it, the tube's apparent diameter) rather
+    /// than refusing the edit. A sharper corner on either end now correctly requires more
+    /// clearance to keep the same radius — that's the real geometry, not an over-strict rule.
+    /// Coincident (or near-coincident, within `coincidentEpsilon`) adjacent points are merged away
+    /// first (same as `generate` itself does), so they're never treated as a too-short "segment"
+    /// in their own right.
+    public static func hasValidControlPointSpacing(_ controlPoints: [SIMD3<Float>], radius: Float) -> Bool {
+        let points = mergeCoincidentPoints(controlPoints)
+        guard points.count >= 2 else { return true }
+
+        let clearances = (0 ..< points.count).map { requiredClearance(at: $0, in: points, radius: radius) }
+        for index in 0 ..< points.count - 1 {
+            let length = simd_distance(points[index + 1], points[index])
+            let required = clearances[index] + clearances[index + 1] - spacingTolerance
+            if length < required {
+                return false
+            }
+        }
+        return true
+    }
+
     /// - Parameters:
     ///   - controlPoints: The tube's path, in order. Consecutive points closer than `1e-5`
     ///     apart are merged before generation (a zero-length segment has no direction).
@@ -50,7 +181,16 @@ public enum TubeGeometryGenerator {
     ///     constant across repeated calls during a drag for the in-place fast path (see
     ///     `ProceduralGeometryExtension`) to keep recognizing the topology as unchanged.
     /// - Returns: `nil` if, after merging duplicates, fewer than 2 distinct control points
-    ///   remain, or if `radius`/`radialSegments` are out of range.
+    ///   remain, if `radius`/`radialSegments` are out of range, or if any ring would need to be
+    ///   narrower than `requiredRingRadius(at:in:radius:)` to fit its own adjacent segment(s) —
+    ///   see `hasValidControlPointSpacing`. That last case is deliberately a hard refusal, not a
+    ///   best-effort patch: an earlier version of this generator instead shrank an over-wide ring
+    ///   down to fit, which kept the mesh finite but made the tube visibly thinner right at the
+    ///   corner that needed the correction — exactly backwards from "the radius never changes
+    ///   unless the caller changes it." Refusing here means a caller that reaches this with bad
+    ///   data (a direct `TubePathComponent` write that bypassed
+    ///   `ProceduralGeometryExtension`'s own editing API, for instance) gets its last
+    ///   successfully-built mesh left alone instead of a corrupted *or* visibly-shrunk one.
     public static func generate(
         controlPoints: [SIMD3<Float>],
         radius: Float,
@@ -78,6 +218,11 @@ public enum TubeGeometryGenerator {
         } ?? mergedPoints
         let points = mergeCoincidentPoints(roundedPoints)
         guard points.count >= 2 else { return nil }
+        // Checked on `points` — the final, actually-swept list — not the caller's raw
+        // `controlPoints`: corner rounding can turn one sharp corner that wouldn't have passed
+        // this check into several much gentler arc segments that do, so checking any earlier
+        // would reject configurations `bendRadius` rounding would otherwise have made valid.
+        guard hasValidControlPointSpacing(points, radius: radius) else { return nil }
 
         let segmentDirections = (0 ..< points.count - 1).map {
             normalize(points[$0 + 1] - points[$0])
@@ -96,10 +241,13 @@ public enum TubeGeometryGenerator {
         uvs.reserveCapacity(points.count * radialSegments)
         tangents.reserveCapacity(points.count * radialSegments)
 
+        let segmentLengths = (0 ..< segmentDirections.count).map {
+            simd_length(points[$0 + 1] - points[$0])
+        }
+
         var cumulativeLength: [Float] = [0]
         for index in 0 ..< segmentDirections.count {
-            let length = simd_length(points[index + 1] - points[index])
-            cumulativeLength.append(cumulativeLength[index] + length)
+            cumulativeLength.append(cumulativeLength[index] + segmentLengths[index])
         }
         let totalLength = max(cumulativeLength.last ?? 1, 1e-6)
 
@@ -122,12 +270,16 @@ public enum TubeGeometryGenerator {
             let right = simd_length(projectedRight) > 1e-6 ? normalize(projectedRight) : orthogonal(to: plane.normal)
             let up = cross(plane.normal, right)
 
-            // Miter radius correction: a ring on the bisector plane between two segments needs
-            // a larger radius so the tube's actual cross-section (perpendicular to travel)
-            // stays constant. Clamped so a near-180-degree reversal doesn't blow up to
-            // infinity — an accepted limitation for sharp turns in this milestone.
-            let cosHalfAngle = max(dot(plane.normal, plane.referenceDirection), 0.2)
-            let ringRadius = radius / cosHalfAngle
+            // Miter radius correction: a ring on the bisector plane between two segments needs a
+            // larger radius so the tube's actual cross-section (perpendicular to travel) stays
+            // constant — exactly `requiredRingRadius`, the same formula `hasValidControlPointSpacing`
+            // already confirmed (before `generate` ever got this far) fits both of this ring's
+            // adjacent segments. Never shrunk to fit a short segment: an earlier version of this
+            // generator clamped the radius down when it didn't fit, which kept the mesh finite but
+            // made the tube visibly — and silently — thinner right at the corner that needed
+            // widening. Now a configuration that can't support this radius is refused up front
+            // instead, so by the time this line runs, it's already guaranteed to fit.
+            let ringRadius = requiredRingRadius(at: ringIndex, in: points, radius: radius)
 
             let v = cumulativeLength[ringIndex] / totalLength
 
@@ -218,7 +370,7 @@ public enum TubeGeometryGenerator {
         let referenceDirection: SIMD3<Float>
     }
 
-    private static func mergeCoincidentPoints(_ points: [SIMD3<Float>], epsilon: Float = 1e-5) -> [SIMD3<Float>] {
+    private static func mergeCoincidentPoints(_ points: [SIMD3<Float>], epsilon: Float = coincidentEpsilon) -> [SIMD3<Float>] {
         guard var previous = points.first else { return [] }
         var merged = [previous]
         for point in points.dropFirst() where simd_distance(point, previous) > epsilon {

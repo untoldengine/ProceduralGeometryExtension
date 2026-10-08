@@ -51,6 +51,126 @@ final class TubeInteriorBendDragTests: XCTestCase {
         XCTAssertNil(TubeInteriorBendDrag(tubeId: entityId, index: path.count))
     }
 
+    /// Regression coverage for a real on-device bug: a U-shaped tube (`A` top-left, `B`
+    /// bottom-left bend, `C` bottom-right bend, `D` top-right), dragging `B` straight toward `C`
+    /// along their shared (locked) axis. `TubeGeometryGenerator`'s own miter clamp bounds any one
+    /// ring to at most half of its shortest adjacent segment, but floors that at the tube's
+    /// nominal radius — so as the `B`-`C` segment shrinks past the tube's diameter, both of its
+    /// end rings sit at the full nominal radius while closer together than that radius allows,
+    /// which self-intersects into a twisted sweep no per-ring clamp can undo after the fact. The
+    /// fix is clamping `B`'s movement *before* the segment ever gets that short — this is what
+    /// `effectiveMinimumSegmentLength` (floored at the tube's own diameter, not the fixed 0.05
+    /// default) exists to guarantee, for whatever radius a caller picks, not just this demo's.
+    /// `B` is never removed by this drag — see the type's own doc comment for why automatic
+    /// topology changes on proximity are gone entirely, not just rebalanced.
+    func testUpdate_danglingSegmentShorterThanDiameter_neverOccurs_forAnyRadius() throws {
+        for radius: Float in [0.03, 0.1, 0.25] {
+            let uShape: [SIMD3<Float>] = [
+                SIMD3(0, 3, 0), SIMD3(0, 0, 0), SIMD3(2, 0, 0), SIMD3(2, 3, 0),
+            ]
+            let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
+                controlPoints: uShape, radius: radius, radialSegments: 8
+            ))
+            var drag = try XCTUnwrap(TubeInteriorBendDrag(tubeId: entityId, index: 1))
+
+            // Drag B (index 1) toward C (index 2) in small steps, well past the point where the
+            // segment between them would hit the floor.
+            var step: Float = 0
+            while step < 2.1 {
+                step += 0.02
+                let rawPosition = SIMD3<Float>(step, 0, 0)
+                // Never removed — update() always returns a position now, never nil.
+                XCTAssertNotNil(drag.update(rawPosition: rawPosition), "radius \(radius), step \(step)")
+
+                // At every single frame, whatever control points currently exist must produce
+                // finite, non-degenerate geometry — the bug reproduced here is a standing
+                // distortion that persists frame over frame, not a one-time glitch.
+                let component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
+                XCTAssertEqual(component.controlPoints.count, 4, "radius \(radius), step \(step)")
+                let output = try XCTUnwrap(TubeGeometryGenerator.generate(
+                    controlPoints: component.controlPoints, radius: radius, radialSegments: 8
+                ))
+                for position in output.positions {
+                    XCTAssertTrue(
+                        position.x.isFinite && position.y.isFinite && position.z.isFinite,
+                        "radius \(radius), step \(step): non-finite vertex in \(component.controlPoints)"
+                    )
+                }
+
+                // The segment between B and C must never be shorter than the tube's own
+                // diameter — the actual condition that lets adjacent rings overlap into a
+                // twisted sweep.
+                let segmentLength = simd_distance(component.controlPoints[1], component.controlPoints[2])
+                XCTAssertGreaterThanOrEqual(
+                    segmentLength, radius * 2 - 1e-4,
+                    "radius \(radius), step \(step): B-C segment thinner than the tube's own diameter"
+                )
+
+                // The actual regression this task reports: B and C's own rings must stay at the
+                // exact, uncompressed 90-degree miter radius throughout the whole approach — never
+                // shrunk to fit the shrinking segment between them, right up to (and including)
+                // the frame where the clamp floor holds them at their closest.
+                let expectedRingRadius = radius / Float(cos(Double.pi / 4))
+                for (ringStart, center) in [(8, component.controlPoints[1]), (16, component.controlPoints[2])] {
+                    for index in ringStart ..< ringStart + 8 {
+                        let distance = simd_distance(output.positions[index], center)
+                        XCTAssertEqual(
+                            distance, expectedRingRadius, accuracy: 1e-3,
+                            "radius \(radius), step \(step): ring at \(center) was shrunk below the tube's actual diameter"
+                        )
+                    }
+                }
+            }
+
+            // The drag must have actually resolved the approach by holding B away from C, never
+            // by silently leaving a corrupted tube — and never by removing B.
+            let finalComponent = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
+            XCTAssertEqual(finalComponent.controlPoints.count, 4)
+        }
+    }
+
+    /// Same U-shape bug as `testUpdate_danglingSegmentShorterThanDiameter_neverOccurs_forAnyRadius`,
+    /// but ending the drag with a single `end()` call well past the collapse point instead of a
+    /// long run of `update()` calls — the actual shape of a real gesture, which typically ends in
+    /// one release sample, not dozens of intermediate frames. `end()` deliberately never removes
+    /// a bend (release jitter shouldn't delete structure), but before this fix it also never
+    /// floored the locked segment's length the way `update()` does, so a release landing past the
+    /// collapse point left the self-intersecting segment permanently in place with nothing left
+    /// to fix it — exactly the on-device report this task describes.
+    func testEnd_draggedBTowardC_neverLeavesSegmentShorterThanDiameter_forAnyRadius() throws {
+        for radius: Float in [0.03, 0.1, 0.25] {
+            let uShape: [SIMD3<Float>] = [
+                SIMD3(0, 3, 0), SIMD3(0, 0, 0), SIMD3(2, 0, 0), SIMD3(2, 3, 0),
+            ]
+            let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
+                controlPoints: uShape, radius: radius, radialSegments: 8
+            ))
+            var drag = try XCTUnwrap(TubeInteriorBendDrag(tubeId: entityId, index: 1))
+
+            // A single release sample almost on top of C (index 2) — well past where the segment
+            // would naturally collapse.
+            _ = drag.end(rawPosition: SIMD3(1.999, 0, 0))
+
+            let component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
+            let output = try XCTUnwrap(TubeGeometryGenerator.generate(
+                controlPoints: component.controlPoints, radius: radius, radialSegments: 8
+            ))
+            for position in output.positions {
+                XCTAssertTrue(
+                    position.x.isFinite && position.y.isFinite && position.z.isFinite,
+                    "radius \(radius): non-finite vertex in \(component.controlPoints)"
+                )
+            }
+
+            XCTAssertEqual(component.controlPoints.count, 4) // end() never removes
+            let segmentLength = simd_distance(component.controlPoints[1], component.controlPoints[2])
+            XCTAssertGreaterThanOrEqual(
+                segmentLength, radius * 2 - 1e-4,
+                "radius \(radius): B-C segment thinner than the tube's own diameter after end()"
+            )
+        }
+    }
+
     func testUpdate_withReferenceRotation_locksToTheRotatedFrameNotWorldAxes() throws {
         // Same 90-degrees-around-Y rotation as the equivalent TubeEndpointDrag test — local +X
         // maps to world (0, 0, -1); local +Y is unaffected (it's the rotation axis). This is
@@ -127,40 +247,60 @@ final class TubeInteriorBendDragTests: XCTestCase {
         XCTAssertEqual(component.controlPoints, [SIMD3(0, 0.5, 0), SIMD3(2, 0.5, 0), SIMD3(2, 3, 0), SIMD3(5, 3, 0)])
     }
 
-    func testUpdate_collapsingBackSegment_removesBendAndReconnectsPerfectlyAxisAligned() throws {
+    func testUpdate_pullingPastCollapse_onBackSegment_clampsInsteadOfRemoving() throws {
+        // radius 0.1, both ends of this segment are 90-degree corners... except index 0 (the
+        // back-side far end here) is the path's own open end, not a corner — so its clearance is
+        // zero, and effectiveMinimumSegmentLength.back = max(0.05, ownClearance(0.1) + 0) = 0.1,
+        // not the tube's diameter (0.2). See `TubeGeometryGenerator.requiredMiterClearance`.
         let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
             controlPoints: path, radius: 0.1, radialSegments: 8
         ))
         var drag = try XCTUnwrap(TubeInteriorBendDrag(tubeId: entityId, index: 1))
 
-        // Pull back nearly to (0,0,0) — the back segment (length 2) drops well below the 0.05
-        // minimum.
-        let result = drag.update(rawPosition: SIMD3(0.02, 0, 0))
+        // Pull back nearly to (0,0,0) — well past where the back segment (length 2) would drop
+        // below the 0.1 floor.
+        let result = try XCTUnwrap(drag.update(rawPosition: SIMD3(0.02, 0, 0)))
 
-        XCTAssertNil(result) // signals: this bend no longer exists
+        // Never removed — clamped so the back segment holds at exactly the floor (0.1) instead,
+        // with the non-locked (forward) side rigidly translated by the same delta, same as any
+        // other point on this axis.
+        XCTAssertEqual(result.x, 0.1, accuracy: 1e-4)
         let component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
-        XCTAssertEqual(component.controlPoints.count, 3)
-        // Reconnected by exactly the original forward vector (0,3,0) from (0,0,0) — not merely
-        // "close" to axis-aligned, exactly so, confirming the exact-delta snap.
-        XCTAssertEqual(component.controlPoints, [SIMD3(0, 0, 0), SIMD3(0, 3, 0), SIMD3(3, 3, 0)])
+        XCTAssertEqual(component.controlPoints.count, 4)
+        XCTAssertEqual(component.controlPoints[0], SIMD3(0, 0, 0))
+        XCTAssertEqual(component.controlPoints[1].x, 0.1, accuracy: 1e-4)
+        XCTAssertEqual(component.controlPoints[2].x, 0.1, accuracy: 1e-4)
+        XCTAssertEqual(component.controlPoints[2].y, 3, accuracy: 1e-4)
+        XCTAssertEqual(component.controlPoints[3].x, 3.1, accuracy: 1e-4)
+        XCTAssertEqual(component.controlPoints[3].y, 3, accuracy: 1e-4)
+        XCTAssertEqual(component.controlPoints[3].z, 0, accuracy: 1e-4)
     }
 
-    func testUpdate_collapsingForwardSegment_removesBendAndReconnectsPerfectlyAxisAligned() throws {
+    func testUpdate_pullingPastCollapse_onForwardSegment_clampsInsteadOfRemoving() throws {
+        // index 3 (the forward-side far end here) is also the path's own open end — same
+        // reasoning as the back-segment test above: floor = max(0.05, 0.1 + 0) = 0.1.
         let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
             controlPoints: path, radius: 0.1, radialSegments: 8
         ))
         var drag = try XCTUnwrap(TubeInteriorBendDrag(tubeId: entityId, index: 2))
 
-        // Pull index 2 nearly onto index 3 (5,3,0) — the forward segment (length 3) collapses.
-        let result = drag.update(rawPosition: SIMD3(4.98, 3, 0))
+        // Pull index 2 nearly onto index 3 (5,3,0) — well past where the forward segment
+        // (length 3) would drop below the 0.1 floor.
+        let result = try XCTUnwrap(drag.update(rawPosition: SIMD3(4.98, 3, 0)))
 
-        XCTAssertNil(result)
+        XCTAssertEqual(result.x, 4.9, accuracy: 1e-4)
         let component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
-        XCTAssertEqual(component.controlPoints.count, 3)
-        XCTAssertEqual(component.controlPoints, [SIMD3(3, 0, 0), SIMD3(5, 0, 0), SIMD3(5, 3, 0)])
+        XCTAssertEqual(component.controlPoints.count, 4)
+        XCTAssertEqual(component.controlPoints[0].x, 2.9, accuracy: 1e-4)
+        XCTAssertEqual(component.controlPoints[0].y, 0, accuracy: 1e-4)
+        XCTAssertEqual(component.controlPoints[1].x, 4.9, accuracy: 1e-4)
+        XCTAssertEqual(component.controlPoints[1].y, 0, accuracy: 1e-4)
+        XCTAssertEqual(component.controlPoints[2].x, 4.9, accuracy: 1e-4)
+        XCTAssertEqual(component.controlPoints[2].y, 3, accuracy: 1e-4)
+        XCTAssertEqual(component.controlPoints[3], SIMD3(5, 3, 0))
     }
 
-    func testEnd_evenPastCollapseThreshold_neverRemoves() throws {
+    func testEnd_evenPastCollapseThreshold_neverRemovesButClampsToTheFloor() throws {
         let entityId = try XCTUnwrap(ProceduralGeometryExtension.shared.createTubeEntity(
             controlPoints: path, radius: 0.1, radialSegments: 8
         ))
@@ -170,6 +310,12 @@ final class TubeInteriorBendDragTests: XCTestCase {
 
         let component = try XCTUnwrap(scene.get(component: TubePathComponent.self, for: entityId))
         XCTAssertEqual(component.controlPoints.count, 4) // untouched — no removal from end()
+        // Floored at 0.1 (this bend's own 90-degree clearance against the path's open end at
+        // index 0, which needs none of its own) — not driven to the raw input. `end()` never
+        // removes a bend, but it must still floor the locked segment the same way `update()`
+        // does, or a release lands on a self-intersecting segment with nothing left to fix it.
+        // See `TubeInteriorBendDrag.clampedScalar`.
+        XCTAssertEqual(result.x, 0.1, accuracy: 1e-4)
         XCTAssertEqual(component.controlPoints[1], result)
     }
 }

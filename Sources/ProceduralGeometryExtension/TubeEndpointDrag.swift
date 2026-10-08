@@ -71,12 +71,13 @@ public struct TubeEndpointDrag {
     /// deliberate, while a genuinely sustained redirect still commits within a handful of frames.
     private var pendingTurnAxis: SIMD3<Float>?
     private var pendingTurnStreak: Int = 0
-    /// The `(neighborPosition, lockedAxis)` state each bend *this drag* has committed replaced,
-    /// most recent last — so a reversal past a bend this same drag just created can undo it and
-    /// resume from the segment before it, rather than only ever retracting toward (and stopping
-    /// at) it. Scoped to this one drag: bends from an earlier, already-finished gesture are never
-    /// on this stack, so a reversal can never reach back and remove one of those.
-    private var undoStack: [(neighborPosition: SIMD3<Float>, lockedAxis: SIMD3<Float>)] = []
+    /// The `(neighborPosition, lockedAxis, farClearance)` state each bend *this drag* has
+    /// committed replaced, most recent last — so a reversal past a bend this same drag just
+    /// created can undo it and resume from the segment before it, rather than only ever
+    /// retracting toward (and stopping at) it. Scoped to this one drag: bends from an earlier,
+    /// already-finished gesture are never on this stack, so a reversal can never reach back and
+    /// remove one of those.
+    private var undoStack: [(neighborPosition: SIMD3<Float>, lockedAxis: SIMD3<Float>, farClearance: Float)] = []
     /// The last *effective* (post-clamp) position fed through `clampToPlausibleStep`, or `nil`
     /// before the first call. Deliberately the clamped value, not the raw input — so a sustained
     /// run of implausible readings gets rate-limited frame over frame rather than jumping straight
@@ -87,6 +88,35 @@ public struct TubeEndpointDrag {
     /// plain world-axis snapping.
     private let rotation: simd_quatf?
     private let configuration: Configuration
+    /// This tube's radius, read once at `init` (radius is never touched by this type).
+    private let radius: Float
+    /// The clearance `neighborPosition`'s own corner currently consumes from this segment (see
+    /// `TubeGeometryGenerator.requiredMiterClearance` for why *clearance*, not ring radius, is the
+    /// quantity a segment-length floor needs) — zero if the neighbor isn't a real corner (a
+    /// straight 2-point tube's other open end), or the true miter clearance if it is one. The
+    /// dragged tip's own side never needs a term here at all: it's always the path's own open end,
+    /// never a corner, so its own clearance is always exactly zero — unlike
+    /// `TubeInteriorBendDrag`'s two (generally nonzero) per-side floors, this type only ever has
+    /// one dynamic value to track. Not a constant: every time this drag plants a new bend at
+    /// `neighborPosition`, that bend's own corner (and so its required clearance) is new too, and
+    /// undoing back past a bend this drag created must restore the *previous* neighbor's own
+    /// value, not recompute some other one — see the `undoStack` entries, which carry this
+    /// alongside the state it goes with.
+    private var farClearance: Float
+    /// `configuration.minimumSegmentLength`, floored at the exact length the current segment
+    /// needs for its one real corner (`farClearance`, at `neighborPosition`) to fit — the dragged
+    /// tip's own side never adds anything, since it's never itself a corner (see `farClearance`'s
+    /// doc comment). An earlier version used a flat `radius * 2` here, which happens to be exactly
+    /// right only when the neighbor is an ordinary 90-degree corner (`radius * 2` ≈
+    /// `0 + radius * tan(45°) * 2`... worked out to the same number by coincidence, not because
+    /// the formula was actually tracking the right quantity) but was wrong whenever the neighbor
+    /// wasn't a corner at all (too conservative — `radius * 2` extra clearance demanded for no
+    /// real corner there) or was sharper than 90 degrees (too permissive — letting a drag walk
+    /// into the exact degenerate band `TubeGeometryGenerator.generate` now refuses outright,
+    /// forcing a visible freeze instead of the smooth clamp the user expects).
+    private var effectiveMinimumSegmentLength: Float {
+        max(configuration.minimumSegmentLength, farClearance)
+    }
 
     /// Tuning knobs, exposed so a consumer can adjust feel without forking this type. Defaults
     /// match what shipped in the ProceduralGeometry demo after extensive on-device XR tuning.
@@ -191,6 +221,10 @@ public struct TubeEndpointDrag {
         self.rotation = component.referenceRotation
         self.lockedAxis = nearestCardinalAxis(to: currentPosition - neighborPosition, relativeTo: rotation)
         self.configuration = configuration
+        radius = component.radius
+        farClearance = TubeGeometryGenerator.requiredClearance(
+            at: neighborIndex, in: component.controlPoints, radius: component.radius
+        )
     }
 
     /// Call every frame with the current raw position of whatever the caller is using to drag
@@ -245,7 +279,15 @@ public struct TubeEndpointDrag {
                 if pendingTurnStreak >= configuration.turnConfirmationFrames {
                     let fullDelta = rawPosition - neighborPosition
                     let alongLockedAxis = dot(fullDelta, lockedAxis)
-                    if alongLockedAxis > configuration.minimumSegmentLength,
+                    // The new bend's own clearance — it's a genuine corner between the
+                    // currently-locked axis and the newly-dominant one, not the zero clearance a
+                    // path's open end has — computed directly from the two axes involved rather
+                    // than re-reading them back out of the array once inserted.
+                    let newBendClearance = TubeGeometryGenerator.requiredMiterClearance(
+                        radius: radius, incoming: lockedAxis, outgoing: candidateAxis
+                    )
+                    let requiredLength = max(configuration.minimumSegmentLength, farClearance + newBendClearance)
+                    if alongLockedAxis > requiredLength,
                        let component = scene.get(component: TubePathComponent.self, for: tubeId) {
                         let bendPosition = neighborPosition + lockedAxis * alongLockedAxis
                         // The new bend always lands adjacent to whichever end is being dragged:
@@ -256,9 +298,10 @@ public struct TubeEndpointDrag {
                         let insertIndex = isStart ? 1 : component.controlPoints.count - 1
 
                         if ProceduralGeometryExtension.shared.insertControlPoint(entityId: tubeId, at: insertIndex, bendPosition) {
-                            undoStack.append((neighborPosition: neighborPosition, lockedAxis: lockedAxis))
+                            undoStack.append((neighborPosition: neighborPosition, lockedAxis: lockedAxis, farClearance: farClearance))
                             neighborPosition = bendPosition
                             lockedAxis = candidateAxis
+                            farClearance = newBendClearance
                             recentPositions.removeAll(keepingCapacity: true)
                             pendingTurnAxis = nil
                             pendingTurnStreak = 0
@@ -329,6 +372,7 @@ public struct TubeEndpointDrag {
             undoStack.removeLast()
             neighborPosition = previous.neighborPosition
             lockedAxis = previous.lockedAxis
+            farClearance = previous.farClearance
             recentPositions.removeAll(keepingCapacity: true)
             pendingTurnAxis = nil
             pendingTurnStreak = 0
@@ -340,7 +384,7 @@ public struct TubeEndpointDrag {
         // Floored on every call, not just when a bend commits — dragging the tip back toward
         // (or past) its own neighbor would otherwise shrink this segment toward zero or negative
         // length with nothing stopping it.
-        let alongLockedAxis = max(dot(updatedDelta, lockedAxis), configuration.minimumSegmentLength)
+        let alongLockedAxis = max(dot(updatedDelta, lockedAxis), effectiveMinimumSegmentLength)
         let constrainedPosition = neighborPosition + lockedAxis * alongLockedAxis
 
         writeControlPoint(position: constrainedPosition)
